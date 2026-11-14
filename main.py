@@ -14,7 +14,12 @@ Strategy (long only, at most one position, paper USDC):
         long high, sits within CAP_BAND_BPS of the long low (it is printing
         the low), and RSI is at most CAP_RSI_MAX — a washed-out bottom;
       - retest: the long low is at least RETEST_AGE bars old and the close
-        is back within RETEST_BAND_BPS above it — divergence entries only.
+        is back within RETEST_BAND_BPS above it — divergence entries only;
+      - day-low retest: the lowest close of the whole window is at least
+        DAY_AGE bars old and the close is back within DAY_BAND_BPS above
+        it — a double bottom against the day's low, confirmed by either
+        momentum signal. A fresh breakdown is young and fails the age
+        test, and a close that has already bounced away fails the band.
     Mid-waterfall dips and fresh breakdowns through the low are not bought.
   * Entries are all-in (SIZE_PCT of cash) and capped at MAX_TRIPS entries in
     any trailing TRIP_WIN bars, with a COOLDOWN after every exit, and none
@@ -27,7 +32,9 @@ Strategy (long only, at most one position, paper USDC):
     pauses, and once it closes the primary logic may resume.
   * While holding, sell everything when the close reaches TP_BPS above the
     position's cost basis (fees included) or SL_BPS below it (the FB_*
-    levels when the position is the insurance trade).
+    levels when the position is the insurance trade, the DAY_* levels when
+    it came from the day-low retest zone — that bounce is shorter, so it
+    banks less and steps aside sooner).
   * Every order carries a max_slippage_bps measured from the latest close:
     tight for buys (a fill far above the close means the dip already bounced),
     wide for sells (an exit must not be refused when it matters).
@@ -42,6 +49,13 @@ halfway through the day then also trades, for two round trips and
 load-bearing guards (CAP_RSI_MAX 28, CAP_FALL_BPS 340, LONG_WIN 240,
 SWING_SPAN 4) were re-verified unchanged — loosening any of them
 re-admits the mid-descent falling-knife entries that lose on this tape.
+A final pass added the day-low retest zone (DAY_AGE 240, DAY_BAND_BPS 50,
+DAY_TP_BPS 90, DAY_SL_BPS 100): late in the day the tape retests the
+capitulation low itself, which the 240-bar retest zone cannot see (its
+low is too young there), and that third round trip takes the dev window
+to +$35.83. The band sits mid-plateau (34-64 all score $35.8-36.8; at
+65+ the entry slips one bar earlier into the fall and the trade dies),
+and the TP plateau is 60-108 against a cliff at 110.
 
 Deterministic: no wall clock, no randomness, no environment reads; the only
 inputs are the hello and the batches themselves. Prices are integers at the
@@ -75,6 +89,12 @@ PARAMS = {
     "cap_rsi_max": 28,    # capitulation: RSI at most this (100 = no cap)
     "retest_age": 60,     # retest: the long low is at least this many bars old
     "retest_band_bps": 170,  # retest: close within this above the long low
+    "day_on": 1,          # 1: the day-low retest zone (below) may trigger entries
+    "day_age": 240,       # day retest: the window's lowest close is at least this old
+    "day_band_bps": 50,   # day retest: close within this above that lowest close
+    "day_cross": 1,       # 1: an RSI cross-up (not only a divergence) may confirm it
+    "day_tp_bps": 90,     # day retest: take profit vs cost basis (its bounce is shorter)
+    "day_sl_bps": 100,    # day retest: stop loss vs cost basis
     "late_cutoff": 1250,  # no entries after this bar index
     "tp_bps": 150,        # take profit vs cost basis
     "sl_bps": 100,        # stop loss vs cost basis
@@ -118,6 +138,8 @@ class Bot:
         self.filled_buys = 0      # filled buys of any kind (primary or insurance)
         self.fb_active = False    # the open position is the insurance trade
         self.pending_fb = False   # the pending order belongs to the insurance trade
+        self.pending_zone = None  # zone that decided the pending primary buy
+        self.active_zone = None   # zone the open primary position came from
 
     # -- indicators ------------------------------------------------------
     def _push_close(self, close):
@@ -207,13 +229,17 @@ class Bot:
                         self.fb_active = True
                     else:
                         self.entries.append(len(self.closes) - 1)
+                        self.active_zone = self.pending_zone
                 self.pending = None
                 self.pending_fb = False
+                self.pending_zone = None
             elif self.pending == "sell" and fill["side"] == "sell":
                 if fill.get("status") == "filled":
                     self.cooldown_until = len(self.closes) - 1 + self.p["cooldown"]
                     if self.pending_fb:
                         self.fb_active = False
+                    else:
+                        self.active_zone = None
                 self.pending = None
                 self.pending_fb = False
         if state.warming_up or not self.closes:
@@ -227,6 +253,9 @@ class Bot:
             if self.fb_active:
                 tp = basis * (10000 + self.p["fb_tp_bps"]) // 10000
                 sl = basis * (10000 - self.p["fb_sl_bps"]) // 10000
+            elif self.active_zone == "day":
+                tp = basis * (10000 + self.p["day_tp_bps"]) // 10000
+                sl = basis * (10000 - self.p["day_sl_bps"]) // 10000
             else:
                 tp = basis * (10000 + self.p["tp_bps"]) // 10000
                 sl = basis * (10000 - self.p["sl_bps"]) // 10000
@@ -266,9 +295,10 @@ class Bot:
         if not (div_ok or cross_ok):
             return None
         # Zone gate: a dip is only bought at the capitulation low itself
-        # (a deep fall from the long high, printing the low now) or on a
+        # (a deep fall from the long high, printing the low now), on a
         # retest of an old low (divergence only — a falling knife through
-        # the level has no divergence and is skipped).
+        # the level has no divergence and is skipped), or on a retest of
+        # the whole window's low when that low is old (the day zone).
         long = self.closes[max(0, i - self.p["long_win"] + 1):i + 1]
         hi = max(long)
         lo = min(long)
@@ -283,9 +313,24 @@ class Bot:
         zone_cap = (fall_bps >= self.p["cap_fall_bps"] and above_bps <= self.p["cap_band_bps"]
                     and rsi_now is not None and rsi_now <= self.p["cap_rsi_max"])
         zone_ret = lo_age >= self.p["retest_age"] and above_bps <= self.p["retest_band_bps"]
-        if zone_ret and not zone_cap and not div_ok:
-            return None
-        if not (zone_cap or zone_ret):
+        # Day-low retest zone: the lowest close of the whole window is old
+        # (it printed long ago, early in the day) and the close is back down
+        # near it — a double bottom against the day's low, not a fresh
+        # breakdown (a fresh low is young and fails the age test). Either
+        # momentum signal may confirm; the bounce off such a low is shorter
+        # than the capitulation bounce, so these entries exit on DAY_* levels.
+        zone_day = False
+        if self.p["day_on"] == 1:
+            day_lo = min(self.closes)
+            day_age = 0
+            for j in range(len(self.closes) - 1, -1, -1):
+                if self.closes[j] == day_lo:
+                    day_age = i - j
+                    break
+            above_day_bps = (close / day_lo - 1.0) * 10000
+            zone_day = (day_age >= self.p["day_age"] and above_day_bps <= self.p["day_band_bps"]
+                        and (div_ok or (self.p["day_cross"] == 1 and cross_ok)))
+        if not (zone_cap or zone_day or (zone_ret and div_ok)):
             return None
         notional = state.cash * self.p["size_pct"] // 100
         room = state.weight_room(SYMBOL)
@@ -295,6 +340,7 @@ class Bot:
             return None
         self.pending = "buy"
         self.pending_fb = False
+        self.pending_zone = "day" if zone_day and not zone_cap else ("cap" if zone_cap else "ret")
         return [{
             "side": "buy",
             "client_id": self._next_id("b"),
