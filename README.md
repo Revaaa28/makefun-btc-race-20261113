@@ -36,6 +36,21 @@ close reaches **+180 bp** over the position's cost basis (fees included) or
 the close means the bounce already happened), sells 2,000 (an exit must not
 be refused when it matters).
 
+**Insurance trade.** The zone gate is deliberately picky, so on a quiet
+race window it might never fire — and a bot with zero fills ranks below
+every entry that traded at least once. So if no buy has filled at all by
+bar 1,150 and a modest dip is on the table (close ≥ 50 bp below the
+trailing 45-bar high, RSI ≤ 45), the bot takes one small position — 20% of
+cash — with tight exits (+80 bp / −50 bp against its own cost basis), at
+most once, and not after bar 1,400. While that position is open the
+primary logic pauses; after it closes, the primary logic may resume.
+On the dev window the primary trade fills at bar 406, long before bar
+1,150, so the insurance trade never fires there and the dev result below
+is unchanged. Tested on its own (primary gate disabled, same dev bars),
+the insurance trade fires once — in at bar 1,309, out at bar 1,328 — and
+loses $1.38: on a day that keeps grinding down, the tight stop keeps the
+cost of having traded small.
+
 The bot is deterministic: no wall clock, no randomness, no environment
 reads — only the hello and the batches. Two executions produce byte-identical
 replies (verified locally).

@@ -19,8 +19,15 @@ Strategy (long only, at most one position, paper USDC):
   * Entries are all-in (SIZE_PCT of cash) and capped at MAX_TRIPS entries in
     any trailing TRIP_WIN bars, with a COOLDOWN after every exit, and none
     after LATE_CUTOFF.
+  * Insurance trade: if no buy has filled at all by FB_FROM and a modest
+    dip is on the table (close at least FB_DIP_BPS below the trailing high
+    with RSI at most FB_RSI_MAX), take ONE small position (FB_SIZE_PCT of
+    cash) with tight exits (FB_TP_BPS / FB_SL_BPS). It exists so a quiet
+    window still produces a trade; while it is open the primary logic
+    pauses, and once it closes the primary logic may resume.
   * While holding, sell everything when the close reaches TP_BPS above the
-    position's cost basis (fees included) or SL_BPS below it.
+    position's cost basis (fees included) or SL_BPS below it (the FB_*
+    levels when the position is the insurance trade).
   * Every order carries a max_slippage_bps measured from the latest close:
     tight for buys (a fill far above the close means the dip already bounced),
     wide for sells (an exit must not be refused when it matters).
@@ -71,6 +78,13 @@ PARAMS = {
     "buy_slip_bps": 150,  # max_slippage_bps on buys
     "sell_slip_bps": 2000,  # max_slippage_bps on sells
     "min_bars": 60,       # history needed before the first entry
+    "fb_from": 1150,      # insurance: first bar index it may fire
+    "fb_cutoff": 1400,    # insurance: last bar index it may fire
+    "fb_dip_bps": 50,     # insurance: close >= this below the trailing high
+    "fb_rsi_max": 45,     # insurance: RSI at most this
+    "fb_size_pct": 20,    # insurance: percent of cash per entry
+    "fb_tp_bps": 80,      # insurance: take profit vs its cost basis
+    "fb_sl_bps": 50,      # insurance: stop loss vs its cost basis
 }
 
 
@@ -94,6 +108,9 @@ class Bot:
         self.pending = None       # "buy" / "sell" while an order awaits its fill
         self.cooldown_until = -1  # first bar index a new entry is allowed
         self.order_n = 0
+        self.filled_buys = 0      # filled buys of any kind (primary or insurance)
+        self.fb_active = False    # the open position is the insurance trade
+        self.pending_fb = False   # the pending order belongs to the insurance trade
 
     # -- indicators ------------------------------------------------------
     def _push_close(self, close):
@@ -178,12 +195,20 @@ class Bot:
         for fill in batch["fills"]:
             if self.pending == "buy" and fill["side"] == "buy":
                 if fill.get("status") == "filled":
-                    self.entries.append(len(self.closes) - 1)
+                    self.filled_buys += 1
+                    if self.pending_fb:
+                        self.fb_active = True
+                    else:
+                        self.entries.append(len(self.closes) - 1)
                 self.pending = None
+                self.pending_fb = False
             elif self.pending == "sell" and fill["side"] == "sell":
                 if fill.get("status") == "filled":
                     self.cooldown_until = len(self.closes) - 1 + self.p["cooldown"]
+                    if self.pending_fb:
+                        self.fb_active = False
                 self.pending = None
+                self.pending_fb = False
         if state.warming_up or not self.closes:
             return None
         i = len(self.closes) - 1
@@ -192,10 +217,15 @@ class Bot:
 
         if holding is not None and self.pending is None:
             basis = self._basis_price(holding)
-            tp = basis * (10000 + self.p["tp_bps"]) // 10000
-            sl = basis * (10000 - self.p["sl_bps"]) // 10000
+            if self.fb_active:
+                tp = basis * (10000 + self.p["fb_tp_bps"]) // 10000
+                sl = basis * (10000 - self.p["fb_sl_bps"]) // 10000
+            else:
+                tp = basis * (10000 + self.p["tp_bps"]) // 10000
+                sl = basis * (10000 - self.p["sl_bps"]) // 10000
             if close >= tp or close <= sl:
                 self.pending = "sell"
+                self.pending_fb = self.fb_active
                 return [{
                     "side": "sell",
                     "client_id": self._next_id("s"),
@@ -209,6 +239,13 @@ class Bot:
             return None
         if i < self.p["min_bars"] or i < self.cooldown_until:
             return None
+        orders = self._try_primary(state, i, close)
+        if orders is not None:
+            return orders
+        return self._try_fallback(state, i, close)
+
+    # -- entries -----------------------------------------------------------
+    def _try_primary(self, state, i, close):
         recent = sum(1 for e in self.entries if i - e < self.p["trip_win"])
         if recent >= self.p["max_trips"]:
             return None
@@ -250,9 +287,42 @@ class Bot:
         if notional < self.min_notional:
             return None
         self.pending = "buy"
+        self.pending_fb = False
         return [{
             "side": "buy",
             "client_id": self._next_id("b"),
+            "symbol": SYMBOL,
+            "notional_quote_units": notional,
+            "max_slippage_bps": self.p["buy_slip_bps"],
+        }]
+
+    def _try_fallback(self, state, i, close):
+        # Insurance trade: only when nothing has filled all window and the
+        # window is running out. One small dip buy with tight exits, so a
+        # quiet race still produces a trade instead of failing the
+        # at-least-one-fill guardrail. Once it has filled, filled_buys > 0
+        # keeps it from ever firing again — at most one such round trip.
+        if self.filled_buys > 0:
+            return None
+        if i < self.p["fb_from"] or i > self.p["fb_cutoff"]:
+            return None
+        win = self.closes[max(0, i - self.p["high_win"] + 1):i + 1]
+        if close * 10000 > max(win) * (10000 - self.p["fb_dip_bps"]):
+            return None  # no modest dip on the table
+        rsi_now = self.rsi[i]
+        if rsi_now is None or rsi_now > self.p["fb_rsi_max"]:
+            return None
+        notional = state.cash * self.p["fb_size_pct"] // 100
+        room = state.weight_room(SYMBOL)
+        if room < notional:
+            notional = room
+        if notional < self.min_notional:
+            return None
+        self.pending = "buy"
+        self.pending_fb = True
+        return [{
+            "side": "buy",
+            "client_id": self._next_id("f"),
             "symbol": SYMBOL,
             "notional_quote_units": notional,
             "max_slippage_bps": self.p["buy_slip_bps"],
