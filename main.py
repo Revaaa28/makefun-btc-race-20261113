@@ -34,7 +34,14 @@ Strategy (long only, at most one position, paper USDC):
 
 Tuned on the kit's dev window with a fill-faithful simulator (see README):
 the dev day was a -491 bp grind whose only durable bounce followed the
-capitulation low, so the final parameters buy that pattern and little else.
+capitulation low, so the parameters buy that pattern and little else.
+A later pass widened the retest path (DIP_BPS 50, RETEST_BAND_BPS 170,
+DIV_MIN_BOUNCE_BPS 30, TP_BPS 150): the retest of the capitulation low
+halfway through the day then also trades, for two round trips and
++$27.92 on the dev window. Every widened value sits mid-plateau; the
+load-bearing guards (CAP_RSI_MAX 28, CAP_FALL_BPS 340, LONG_WIN 240,
+SWING_SPAN 4) were re-verified unchanged — loosening any of them
+re-admits the mid-descent falling-knife entries that lose on this tape.
 
 Deterministic: no wall clock, no randomness, no environment reads; the only
 inputs are the hello and the batches themselves. Prices are integers at the
@@ -51,14 +58,14 @@ import makefun_bars  # noqa: E402
 SYMBOL = "CBBTC"
 
 PARAMS = {
-    "dip_bps": 70,        # close must be >= this far below the trailing high
+    "dip_bps": 50,        # close must be >= this far below the trailing high
     "high_win": 45,       # trailing window (bars) for the reference high
     "rsi_len": 14,        # RSI period
     "rsi_os": 30,         # oversold level for the cross-up signal
     "cross_valid": 10,    # bars a cross-up stays tradable
     "div_confirm": 5,     # bars after a swing low before divergence is tradable
     "div_valid": 30,      # bars a divergence stays valid, from the swing low
-    "div_min_bounce_bps": 50,  # min intervening bounce between the two swing lows
+    "div_min_bounce_bps": 30,  # min intervening bounce between the two swing lows
     "div_min_gap": 0,     # min bars between the two swing lows of a divergence
     "cross_on": 1,        # 1: the RSI cross-up alone may trigger an entry
     "swing_span": 4,      # bars on each side of a swing low
@@ -67,9 +74,9 @@ PARAMS = {
     "cap_band_bps": 40,   # capitulation: close within this of the long low
     "cap_rsi_max": 28,    # capitulation: RSI at most this (100 = no cap)
     "retest_age": 60,     # retest: the long low is at least this many bars old
-    "retest_band_bps": 90,  # retest: close within this above the long low
+    "retest_band_bps": 170,  # retest: close within this above the long low
     "late_cutoff": 1250,  # no entries after this bar index
-    "tp_bps": 180,        # take profit vs cost basis
+    "tp_bps": 150,        # take profit vs cost basis
     "sl_bps": 100,        # stop loss vs cost basis
     "max_trips": 3,       # max entries per trailing trip_win bars
     "trip_win": 1440,     # trailing window for the trip cap (bars)

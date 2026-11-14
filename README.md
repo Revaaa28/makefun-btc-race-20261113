@@ -10,7 +10,7 @@ speaks `agent-fun/bars-replay/v1` through the kit's Python SDK shim
 The bot answers every batch with at most one order. It buys a dip only when
 three things line up at the same bar:
 
-1. **A real dip.** The latest close is at least 70 bp below the trailing
+1. **A real dip.** The latest close is at least 50 bp below the trailing
    45-bar high of closes.
 2. **Momentum exhaustion.** Either a bullish RSI(14) divergence — price
    prints a lower swing low while RSI prints a higher low at that swing,
@@ -31,7 +31,7 @@ those entries lost every time.
 Entries are all-in (100% of cash, at most one position), capped at 3 entries
 per trailing 1,440 bars, with a 5-bar cooldown after each exit and no
 entries after bar 1,250. While holding, the bot sells everything when the
-close reaches **+180 bp** over the position's cost basis (fees included) or
+close reaches **+150 bp** over the position's cost basis (fees included) or
 **−100 bp** under it. Buys carry `max_slippage_bps` 150 (a fill far above
 the close means the bounce already happened), sells 2,000 (an exit must not
 be refused when it matters).
@@ -76,6 +76,14 @@ end-of-window flatten at the last close), driving the real bot over stdio:
 - Final parameters sit in the middle of a stable plateau (cap-fall
   340–380 bp × RSI cap 26–30 all give the same trade; TP 180 is below the
   cliff where a 300 bp target is never reached).
+- A second pass widened only the retest path (dip 50 bp, retest band
+  170 bp, minimum divergence bounce 30 bp, TP 150 bp): the divergence
+  retest of the capitulation low at bar 532 then trades too, adding a
+  second round trip (+$14.02). Each widened value is mid-plateau
+  (retest band 130–260, TP 140–160, dip 40–60 all score the same);
+  the guards that keep out mid-descent entries (RSI cap 28, cap-fall
+  340, long window 240, swing span 4) were re-verified as load-bearing
+  — loosening any of them re-admits losing falling-knife trades.
 
 `grade-local` could not run the Python bot on this machine (its docker
 driver needs Docker; its process driver runs node22 only), so the simulator
@@ -83,14 +91,14 @@ driver needs Docker; its process driver runs node22 only), so the simulator
 
 ## Dev-window result
 
-On the kit's dev window (1,440 bars), the final bot makes **one round trip**:
+On the kit's dev window (1,440 bars), the final bot makes **two round trips**:
 
 | Metric | Value |
 | --- | --- |
-| Net PnL | **+$17.12** (17,120,9xx micro-USDC) |
-| Filled orders | 2 (buy at bar 406, sell at bar 658) |
-| Fees paid | $0.81 |
-| Max drawdown | 1.07% |
+| Net PnL | **+$27.92** (27,922,4xx micro-USDC) |
+| Filled orders | 4 (buys at bars 406 and 532, sells at bars 467 and 860) |
+| Fees paid | $1.62 |
+| Max drawdown | 0.68% |
 | Think time | ~0.1 s for all 1,440 batches (budget 1,800 s) |
 
 That passes the dev gate (net PnL > 0 after every fee) with at least one
